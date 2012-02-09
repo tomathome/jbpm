@@ -7,7 +7,7 @@
   <parent>
     <groupId>org.jbpm</groupId>
     <artifactId>jbpm</artifactId>
-    <version>5.2.0-SNAPSHOT</version>
+    <version>5.3.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>jbpm-human-task</artifactId>
@@ -31,12 +31,7 @@
     <dependency>
       <groupId>org.hornetq</groupId>
       <artifactId>hornetq-core</artifactId>
-      <version>2.0.0.GA</version>
-    </dependency>
-    <dependency>
-      <groupId>org.hornetq</groupId>
-      <artifactId>hornetq-transports</artifactId>
-      <version>2.0.0.GA</version>
+      <version>2.2.2.Final</version>
     </dependency>
     <dependency>
       <groupId>javax.jms</groupId>
@@ -70,7 +65,7 @@
       <artifactId>dom4j</artifactId>
     </dependency>		
     <dependency>
-      <groupId>javassist</groupId>
+      <groupId>org.javassist</groupId>
       <artifactId>javassist</artifactId>
     </dependency>
     <dependency>
@@ -84,7 +79,7 @@
     <dependency>
       <groupId>org.jboss.netty</groupId>
       <artifactId>netty</artifactId>
-      <version>3.1.5.GA</version>
+      <version>3.2.0.Final</version>
       <scope>test</scope>
     </dependency>
     <dependency>

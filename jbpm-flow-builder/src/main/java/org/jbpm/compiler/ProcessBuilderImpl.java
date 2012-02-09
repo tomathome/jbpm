@@ -78,8 +78,6 @@ import org.jbpm.workflow.core.node.Trigger;
 /**
  * A ProcessBuilder can be used to build processes based on XML files
  * containing a process definition.
- * 
- * @author <a href="mailto:kris_verlaenen@hotmail.com">Kris Verlaenen</a>
  */
 public class ProcessBuilderImpl implements ProcessBuilder {
 
@@ -130,7 +128,7 @@ public class ProcessBuilderImpl implements ProcessBuilder {
             String rules = generateRules( process );
 //            System.out.println(rules);
             try {
-                packageBuilder.addPackageFromDrl( new StringReader( rules ) );
+                packageBuilder.addPackageFromDrl( new StringReader( rules ), resource );
             } catch ( IOException e ) {
                 // should never occur
                 e.printStackTrace( System.err );

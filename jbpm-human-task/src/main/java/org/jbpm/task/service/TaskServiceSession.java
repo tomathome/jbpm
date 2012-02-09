@@ -16,19 +16,42 @@
 
 package org.jbpm.task.service;
 
-import org.drools.RuleBase;
-import org.drools.StatefulSession;
-import org.jbpm.eventmessaging.EventKeys;
-import org.jbpm.task.*;
-import org.jbpm.task.query.DeadlineSummary;
-import org.jbpm.task.query.TaskSummary;
-import org.jbpm.task.service.TaskService.ScheduledTaskDeadline;
-
-import javax.persistence.*;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
+import javax.naming.InitialContext;
+import javax.persistence.EntityManager;
+import javax.persistence.EntityNotFoundException;
+import javax.persistence.EntityTransaction;
+import javax.persistence.Query;
+import javax.transaction.UserTransaction;
+
+import org.drools.RuleBase;
+import org.drools.StatefulSession;
+import org.jbpm.task.Attachment;
+import org.jbpm.task.Comment;
+import org.jbpm.task.Content;
+import org.jbpm.task.Deadline;
+import org.jbpm.task.Deadlines;
+import org.jbpm.task.Escalation;
+import org.jbpm.task.Group;
+import org.jbpm.task.Notification;
+import org.jbpm.task.OrganizationalEntity;
+import org.jbpm.task.PeopleAssignments;
+import org.jbpm.task.Reassignment;
+import org.jbpm.task.Status;
+import org.jbpm.task.SubTasksStrategy;
+import org.jbpm.task.Task;
+import org.jbpm.task.TaskData;
+import org.jbpm.task.User;
+import org.jbpm.task.query.DeadlineSummary;
+import org.jbpm.task.query.TaskSummary;
+import org.jbpm.task.service.TaskService.ScheduledTaskDeadline;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TaskServiceSession {
 
@@ -36,11 +59,18 @@ public class TaskServiceSession {
     private final EntityManager em;
     private Map<String, RuleBase> ruleBases;
     private Map<String, Map<String, Object>> globals;
-    private EventKeys eventKeys;
+    private Map<String, Boolean> userGroupsMap = new HashMap<String, Boolean>();
+    private String transactionType = "default";
+    
+    private static final Logger logger = LoggerFactory.getLogger(TaskServiceSession.class);
 
     public TaskServiceSession(final TaskService service, final EntityManager em) {
         this.service = service;
         this.em = em;
+    }
+    
+    public void setTransactionType(String type) {
+    	this.transactionType = type;
     }
 
     public void dispose() {
@@ -51,6 +81,10 @@ public class TaskServiceSession {
         return em;
     }
 
+    public org.jbpm.task.service.TaskService getService() {
+        return service;
+    }
+    
     public void setRuleBase(final String type, final RuleBase ruleBase) {
         if (ruleBases == null) {
             ruleBases = new HashMap<String, RuleBase>();
@@ -113,10 +147,13 @@ public class TaskServiceSession {
     }
 
     public void addTask(final Task task, final ContentData contentData)
-        throws CannotAddTaskException
-    {
+        throws CannotAddTaskException {
+        
+        doCallbackOperationForPeopleAssignments(task.getPeopleAssignments());
+        doCallbackOperationForTaskData(task.getTaskData());
+        doCallbackOperationForTaskDeadlines(task.getDeadlines());
+        
         final TaskData taskData = task.getTaskData();
-
         // initialize the task data
         Status currentStatus = taskData.initialize();
 
@@ -130,7 +167,7 @@ public class TaskServiceSession {
             List<OrganizationalEntity> potentialOwners = assignments.getPotentialOwners();
             currentStatus = taskData.assignOwnerAndStatus(potentialOwners);
         }
-
+        
         doOperationInTransaction(new TransactedOperation() {
             public void doOperation() {
                 em.persist(task);
@@ -198,15 +235,17 @@ public class TaskServiceSession {
                 for (Status status : command.getStatus()) {
                     if (taskData.getStatus() == status) {
                         statusMatched = true;
-
                         // next find out if the user can execute this doOperation
-                        if (!isAllowed(command, task, user, groupIds)) {
+                        if (!isAllowed(command, task, user, groupIds)) { 
                             String errorMessage = "User '" + user + "' does not have permissions to execution operation '" + operation + "' on task id " + task.getId();
 
                             throw new PermissionDeniedException(errorMessage);
                         }
 
                         commands(command, task, user, targetEntity);
+                    }
+                    else { 
+                        logger.debug( "No match on status for task " + task.getId() + ": status " + taskData.getStatus() + " != " + status);
                     }
                 }
             }
@@ -224,20 +263,23 @@ public class TaskServiceSession {
 
                         commands(command, task, user, targetEntity);
                     }
+                    else { 
+                        logger.debug( "No match on previous status for task " + task.getId() + ": status " + taskData.getStatus() + " != " + status);
+                    }
                 }
             }
         }
         if (!statusMatched) {
-            String errorMessage = "User '" + user + "' was unable to execution operation '" + operation + "' on task id " + task.getId() + " due to no 'current status' matchines";
+            String errorMessage = "User '" + user + "' was unable to execution operation '" + operation + "' on task id " + task.getId() + " due to a no 'current status' match";
             throw new PermissionDeniedException(errorMessage);
         }
     }
 
-    private static boolean isAllowed(final OperationCommand command, final Task task, final User user,
-    		                         final List<String> groupIds) {
+    private boolean isAllowed(final OperationCommand command, final Task task, final User user,
+    		                         List<String> groupIds) {
         final PeopleAssignments people = task.getPeopleAssignments();
         final TaskData taskData = task.getTaskData();
-
+        
         boolean operationAllowed = false;
         for (Allowed allowed : command.getAllowed()) {
             if (operationAllowed) {
@@ -270,7 +312,7 @@ public class TaskServiceSession {
         }
 
         if (operationAllowed && command.isUserIsExplicitPotentialOwner()) {
-            // if user has rights to execute the command, make sure user is explicitely specified (not as a group)
+            // if user has rights to execute the command, make sure user is explicitly specified (not as a group)
             operationAllowed = people.getPotentialOwners().contains(user);
         }
 
@@ -329,17 +371,21 @@ public class TaskServiceSession {
                               List<String> groupIds) throws TaskException {
         OrganizationalEntity targetEntity = null;
 
+        groupIds = doUserGroupCallbackOperation(userId, groupIds);
+        doCallbackUserOperation(targetEntityId);
         if (targetEntityId != null) {
             targetEntity = getEntity(OrganizationalEntity.class, targetEntityId);
         }
 
         final Task task = getTask(taskId);
-        final User user = getEntity(User.class, userId);
+        
+        User user = getEntity(User.class, userId);
 
+        boolean transactionStarted = false;
         try {
             final List<OperationCommand> commands = service.getCommandsForOperation(operation);
 
-            beginOrUseExistingTransaction();
+            transactionStarted = beginOrUseExistingTransaction();
 
             evalCommand(operation, commands, task, user, targetEntity, groupIds);
 
@@ -370,7 +416,19 @@ public class TaskServiceSession {
                 }
             }
         } catch (RuntimeException e) {
-            em.getTransaction().rollback();
+        	if ("default".equals(transactionType)) {
+	            if (em.getTransaction().isActive()) {
+	                em.getTransaction().rollback();
+	            }
+        	} else if ("local-JTA".equals(transactionType)) {
+        		try {
+        			UserTransaction ut = (UserTransaction)
+        				new InitialContext().lookup( "java:comp/UserTransaction" );
+        			ut.setRollbackOnly();
+        		} catch (Exception exc) {
+        			throw new RuntimeException(e);
+        		}
+        	}
 
             doOperationInTransaction(new TransactedOperation() {
                 public void doOperation() {
@@ -380,15 +438,52 @@ public class TaskServiceSession {
 
             throw e;
         } finally {
-            if (em.getTransaction().isActive()) {
-                em.getTransaction().commit();
-            }
+        	if ("default".equals(transactionType)) {
+	            if (em.getTransaction().isActive()) {
+	                em.getTransaction().commit();
+	            }
+        	} else if ("local-JTA".equals(transactionType)) {
+        		if (transactionStarted) {
+        			try {
+        				UserTransaction ut = (UserTransaction)
+        					new InitialContext().lookup( "java:comp/UserTransaction" );
+        				if (ut.getStatus() == javax.transaction.Status.STATUS_MARKED_ROLLBACK) {
+							ut.rollback();
+        				} else {
+        					ut.commit();
+        				}
+        			} catch (Exception e) {
+        				throw new RuntimeException(e);
+        			}
+        		}
+        	}
+        }
+        switch (operation) {
+	        case Claim: {
+	            postTaskClaimOperation(task);
+	            break;
+	        }
+	        case Complete: {
+	            postTaskCompleteOperation(task);
+	            break;
+	        }
+	        case Fail: {
+	            postTaskFailOperation(task);
+	            break;
+	        }
+	        case Skip: {
+	            postTaskSkipOperation(task, userId);
+	            break;
+	        }
         }
     }
 
     private void taskClaimOperation(final Task task) {
         // Task was reserved so owner should get icals
         SendIcal.getInstance().sendIcalForTask(task, service.getUserinfo());
+    }
+    
+    private void postTaskClaimOperation(final Task task) {
         // trigger event support
         service.getEventSupport().fireTaskClaimed(task.getId(), task.getTaskData().getActualOwner().getId());
     }
@@ -397,10 +492,13 @@ public class TaskServiceSession {
         if (data != null) {
         	setOutput(task.getId(), task.getTaskData().getActualOwner().getId(), data);
         }
-
+        checkSubTaskStrategy(task);
+    }
+    
+    
+    private void postTaskCompleteOperation(final Task task) {
         // trigger event support
         service.getEventSupport().fireTaskCompleted(task.getId(), task.getTaskData().getActualOwner().getId());
-        checkSubTaskStrategy(task);
     }
 
     private void taskFailOperation(final Task task, final ContentData data) {
@@ -408,24 +506,30 @@ public class TaskServiceSession {
         if (data != null) {
         	setFault(task.getId(), task.getTaskData().getActualOwner().getId(), (FaultData) data);
         }
-
-        // trigger event support
+    }
+    
+    private void postTaskFailOperation(final Task task) {
+    	// trigger event support
         service.getEventSupport().fireTaskFailed(task.getId(), task.getTaskData().getActualOwner().getId());
     }
 
     private void taskSkipOperation(final Task task, final String userId) {
-        // trigger event support
-        service.getEventSupport().fireTaskSkipped(task.getId(), userId);
         checkSubTaskStrategy(task);
     }
 
+    private void postTaskSkipOperation(final Task task, final String userId) {
+        // trigger event support
+        service.getEventSupport().fireTaskSkipped(task.getId(), userId);
+    }
+    
     public Task getTask(final long taskId) {
         return getEntity(Task.class, taskId);
     }
 
     public void addComment(final long taskId, final Comment comment) {
         final Task task = getTask(taskId);
-
+        doCallbackOperationForComment(comment);
+        
         doOperationInTransaction(new TransactedOperation() {
             public void doOperation() {
                 task.getTaskData().addComment(comment);
@@ -435,6 +539,7 @@ public class TaskServiceSession {
 
     public void addAttachment(final long taskId, final Attachment attachment, final Content content) {
         final Task task = getTask(taskId);
+        doCallbackOperationForAttachment(attachment);
 
         doOperationInTransaction(new TransactedOperation() {
             public void doOperation() {
@@ -502,6 +607,7 @@ public class TaskServiceSession {
         });
     }
 
+    @SuppressWarnings("unchecked")
     public List<DeadlineSummary> getUnescalatedDeadlines() {
         return (List<DeadlineSummary>) em.createNamedQuery("UnescalatedDeadlines").getResultList();
     }
@@ -513,7 +619,9 @@ public class TaskServiceSession {
         return (Task) task.getSingleResult();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksOwned(final String userId, final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksOwned = em.createNamedQuery("TasksOwned");
         tasksOwned.setParameter("userId", userId);
         tasksOwned.setParameter("language", language);
@@ -521,8 +629,10 @@ public class TaskServiceSession {
         return (List<TaskSummary>) tasksOwned.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksAssignedAsBusinessAdministrator(final String userId,
                                                                      final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksAssignedAsBusinessAdministrator = em.createNamedQuery("TasksAssignedAsBusinessAdministrator");
         tasksAssignedAsBusinessAdministrator.setParameter("userId", userId);
         tasksAssignedAsBusinessAdministrator.setParameter("language", language);
@@ -530,8 +640,10 @@ public class TaskServiceSession {
         return (List<TaskSummary>) tasksAssignedAsBusinessAdministrator.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksAssignedAsExcludedOwner(final String userId,
                                                              final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksAssignedAsExcludedOwner = em.createNamedQuery("TasksAssignedAsExcludedOwner");
         tasksAssignedAsExcludedOwner.setParameter("userId", userId);
         tasksAssignedAsExcludedOwner.setParameter("language", language);
@@ -539,8 +651,10 @@ public class TaskServiceSession {
         return (List<TaskSummary>) tasksAssignedAsExcludedOwner.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksAssignedAsPotentialOwner(final String userId,
                                                               final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksAssignedAsPotentialOwner = em.createNamedQuery("TasksAssignedAsPotentialOwner");
         tasksAssignedAsPotentialOwner.setParameter("userId", userId);
         tasksAssignedAsPotentialOwner.setParameter("language", language);
@@ -550,17 +664,31 @@ public class TaskServiceSession {
 
     public List<TaskSummary> getTasksAssignedAsPotentialOwner(final String userId, final List<String> groupIds,
                                                               final String language) {
+    	return getTasksAssignedAsPotentialOwner(userId, groupIds, language, -1, -1);
+    }
+
+
+    @SuppressWarnings("unchecked")
+    public List<TaskSummary> getTasksAssignedAsPotentialOwner(final String userId, List<String> groupIds,
+                                                              final String language, final int firstResult, int maxResults) {
+        doCallbackUserOperation(userId);
+        groupIds = doUserGroupCallbackOperation(userId, groupIds);
         final Query tasksAssignedAsPotentialOwner = em.createNamedQuery("TasksAssignedAsPotentialOwnerWithGroups");
         tasksAssignedAsPotentialOwner.setParameter("userId", userId);
         tasksAssignedAsPotentialOwner.setParameter("groupIds", groupIds);
         tasksAssignedAsPotentialOwner.setParameter("language", language);
+        if(maxResults != -1) {
+            tasksAssignedAsPotentialOwner.setFirstResult(firstResult);
+            tasksAssignedAsPotentialOwner.setMaxResults(maxResults);
+        }
 
         return (List<TaskSummary>) tasksAssignedAsPotentialOwner.getResultList();
     }
 
-
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getSubTasksAssignedAsPotentialOwner(final long parentId, final String userId,
                                                                  final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksAssignedAsPotentialOwner = em.createNamedQuery("SubTasksAssignedAsPotentialOwner");
         tasksAssignedAsPotentialOwner.setParameter("parentId", parentId);
         tasksAssignedAsPotentialOwner.setParameter("userId", userId);
@@ -569,8 +697,10 @@ public class TaskServiceSession {
         return (List<TaskSummary>) tasksAssignedAsPotentialOwner.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksAssignedAsPotentialOwnerByGroup(final String groupId,
                                                                      final String language) {
+        doCallbackGroupOperation(groupId);
         final Query tasksAssignedAsPotentialOwnerByGroup = em.createNamedQuery("TasksAssignedAsPotentialOwnerByGroup");
         tasksAssignedAsPotentialOwnerByGroup.setParameter("groupId", groupId);
         tasksAssignedAsPotentialOwnerByGroup.setParameter("language", language);
@@ -578,6 +708,7 @@ public class TaskServiceSession {
         return (List<TaskSummary>) tasksAssignedAsPotentialOwnerByGroup.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getSubTasksByParent(final long parentId, final String language) {
         final Query subTaskByParent = em.createNamedQuery("GetSubTasksByParentTaskId");
         subTaskByParent.setParameter("parentId", parentId);
@@ -586,8 +717,10 @@ public class TaskServiceSession {
         return (List<TaskSummary>) subTaskByParent.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksAssignedAsRecipient(final String userId,
                                                          final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksAssignedAsRecipient = em.createNamedQuery("TasksAssignedAsRecipient");
         tasksAssignedAsRecipient.setParameter("userId", userId);
         tasksAssignedAsRecipient.setParameter("language", language);
@@ -595,8 +728,10 @@ public class TaskServiceSession {
         return (List<TaskSummary>) tasksAssignedAsRecipient.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksAssignedAsTaskInitiator(final String userId,
                                                              final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksAssignedAsTaskInitiator = em.createNamedQuery("TasksAssignedAsTaskInitiator");
         tasksAssignedAsTaskInitiator.setParameter("userId", userId);
         tasksAssignedAsTaskInitiator.setParameter("language", language);
@@ -604,8 +739,10 @@ public class TaskServiceSession {
         return (List<TaskSummary>) tasksAssignedAsTaskInitiator.getResultList();
     }
 
+    @SuppressWarnings("unchecked")
     public List<TaskSummary> getTasksAssignedAsTaskStakeholder(final String userId,
                                                                final String language) {
+        doCallbackUserOperation(userId);
         final Query tasksAssignedAsTaskStakeholder = em.createNamedQuery("TasksAssignedAsTaskStakeholder");
         tasksAssignedAsTaskStakeholder.setParameter("userId", userId);
         tasksAssignedAsTaskStakeholder.setParameter("language", language);
@@ -635,6 +772,9 @@ public class TaskServiceSession {
     }
     
     public void nominateTask(final long taskId, String userId, final List<OrganizationalEntity> potentialOwners) {
+        doCallbackUserOperation(userId);
+        doCallbackOperationForPotentialOwners(potentialOwners);
+        
     	final Task task = getEntity(Task.class, taskId);
     	final User user = getEntity(User.class, userId);
     	if (isAllowed(user, null, task.getPeopleAssignments().getBusinessAdministrators())) {
@@ -722,7 +862,7 @@ public class TaskServiceSession {
     	});
     }
     
-    public static boolean isAllowed(final User user, final List<OrganizationalEntity>[] people) {
+    private boolean isAllowed(final User user, final List<OrganizationalEntity>[] people) {
         for (List<OrganizationalEntity> list : people) {
             if (isAllowed(user, null, list)) {
                 return true;
@@ -731,7 +871,7 @@ public class TaskServiceSession {
         return false;
     }
 
-    static boolean isAllowed(final User user, final List<String> groupIds, final List<OrganizationalEntity> entities) {
+    private boolean isAllowed(final User user, final List<String> groupIds, final List<OrganizationalEntity> entities) {
         // for now just do a contains, I'll figure out group membership later.
         for (OrganizationalEntity entity : entities) {
             if (entity instanceof User && entity.equals(user)) {
@@ -793,12 +933,29 @@ public class TaskServiceSession {
     /**
      * Starts a transaction if there isn't one currently in progess.
      */
-    private void beginOrUseExistingTransaction() {
-        final EntityTransaction tx = em.getTransaction();
-
-        if (!tx.isActive()) {
-            tx.begin();
-        }
+    private boolean beginOrUseExistingTransaction() {
+    	if ("default".equals(transactionType)) {
+	        final EntityTransaction tx = em.getTransaction();
+	        if (!tx.isActive()) {
+	            tx.begin();
+	            return true;
+	        }
+	        return false;
+    	} else if ("local-JTA".equals(transactionType)) {
+    		try {
+    			UserTransaction ut = (UserTransaction) new InitialContext().lookup( "java:comp/UserTransaction" );
+		    	if (ut.getStatus() == javax.transaction.Status.STATUS_NO_TRANSACTION) {
+		    		ut.begin();
+		    		em.joinTransaction();
+		    		return true;
+		    	}
+		    	return false;
+    		} catch (Throwable t) {
+        		throw new RuntimeException(t);
+        	}
+    	} else {
+    		throw new IllegalArgumentException("Unknown transaction type " + transactionType);
+    	}
     }
 
     /**
@@ -808,24 +965,370 @@ public class TaskServiceSession {
      * @param operation operation to execute
      */
     private void doOperationInTransaction(final TransactedOperation operation) {
-        final EntityTransaction tx = em.getTransaction();
-
-        try {
-            if (!tx.isActive()) {
-                tx.begin();
-            }
-
-            operation.doOperation();
-
-            tx.commit();
-        } finally {
-            if (tx.isActive()) {
-                tx.rollback();
-            }
-        }
+    	if ("default".equals(transactionType)) {
+	        final EntityTransaction tx = em.getTransaction();
+	        try {
+	            if (!tx.isActive()) {
+	                tx.begin();
+	            }
+	            operation.doOperation();
+	            tx.commit();
+	        } finally {
+	            if( tx.isActive() ) {
+	                tx.rollback();
+	            }
+	        }
+    	} else if ("local-JTA".equals(transactionType)) {
+    		try {
+    			UserTransaction ut = (UserTransaction) new InitialContext().lookup( "java:comp/UserTransaction" );
+		    	if (ut.getStatus() == javax.transaction.Status.STATUS_NO_TRANSACTION) {
+		    		ut.begin();
+		    		em.joinTransaction();
+				    operation.doOperation();
+				    ut.commit();
+		    	} else {
+		    		em.joinTransaction();
+		            operation.doOperation();
+		    	}
+        	} catch (Throwable t) {
+        		throw new RuntimeException(t);
+        	}
+    	}
     }
 
     private interface TransactedOperation {
         void doOperation();
+    }
+    
+    private List<String> doUserGroupCallbackOperation(String userId, List<String> groupIds) {
+        if(UserGroupCallbackManager.getInstance().existsCallback()) {
+            doCallbackUserOperation(userId);
+            doCallbackGroupsOperation(userId, groupIds);
+            // get all groups
+            @SuppressWarnings("unchecked")
+			List<Group> allGroups = ((List<Group>) em.createQuery("from Group").getResultList());
+            List<String> allGroupIds = new ArrayList<String>();
+            if(allGroups != null) {
+            	for(Group g : allGroups) {
+            		allGroupIds.add(g.getId());
+            	}
+            }
+            return UserGroupCallbackManager.getInstance().getCallback().getGroupsForUser(userId, groupIds, allGroupIds);
+        } else {
+            logger.debug("UserGroupCallback has not been registered.");
+            return groupIds;
+        }
+    }
+    
+    private void doCallbackUserOperation(String userId) {
+        if(UserGroupCallbackManager.getInstance().existsCallback()) {
+            if(userId != null && UserGroupCallbackManager.getInstance().getCallback().existsUser(userId)) {
+                addUserFromCallbackOperation(userId);
+            }
+        } else {
+            logger.debug("UserGroupCallback has not been registered.");
+        }
+    }
+    
+    private void doCallbackGroupOperation(String groupId) {
+        if(UserGroupCallbackManager.getInstance().existsCallback()) {
+            if(groupId != null && UserGroupCallbackManager.getInstance().getCallback().existsGroup(groupId)) {
+                addGroupFromCallbackOperation(groupId);
+            }
+        } else {
+            logger.debug("UserGroupCallback has not been registered.");
+        }
+    }
+    
+    private void doCallbackOperationForTaskData(TaskData data) {
+        if(UserGroupCallbackManager.getInstance().existsCallback() && data != null) {
+            if(data.getActualOwner() != null) {
+                doCallbackUserOperation(data.getActualOwner().getId());
+            }
+            
+            if(data.getCreatedBy() != null) {
+                doCallbackUserOperation(data.getCreatedBy().getId());
+            }
+        }
+    }
+    
+    private void doCallbackOperationForPotentialOwners(List<OrganizationalEntity> potentialOwners) {
+        if(UserGroupCallbackManager.getInstance().existsCallback() && potentialOwners != null) { 
+            for(OrganizationalEntity orgEntity : potentialOwners) {
+                if(orgEntity instanceof User) {
+                    doCallbackUserOperation(orgEntity.getId());
+                }
+                if(orgEntity instanceof Group) {
+                    doCallbackGroupOperation(orgEntity.getId());
+                }
+            }
+        }
+    }
+    
+    private void doCallbackOperationForPeopleAssignments(PeopleAssignments assignments) {
+        if(UserGroupCallbackManager.getInstance().existsCallback()) {
+            if(assignments != null) {
+                List<OrganizationalEntity> businessAdmins = assignments.getBusinessAdministrators();
+                if(businessAdmins != null) {
+                    for(OrganizationalEntity admin : businessAdmins) {
+                        if(admin instanceof User) {
+                            doCallbackUserOperation(admin.getId());
+                        }
+                        if(admin instanceof Group) {
+                            doCallbackGroupOperation(admin.getId());
+                        }
+                    }
+                }
+                
+                List<OrganizationalEntity> potentialOwners = assignments.getPotentialOwners();
+                if(potentialOwners != null) {
+                    for(OrganizationalEntity powner : potentialOwners) {
+                        if(powner instanceof User) {
+                            doCallbackUserOperation(powner.getId());
+                        }
+                        if(powner instanceof Group) {
+                            doCallbackGroupOperation(powner.getId());
+                        }
+                    }
+                }
+                
+                if(assignments.getTaskInitiator() != null && assignments.getTaskInitiator().getId() != null) {
+                    doCallbackUserOperation(assignments.getTaskInitiator().getId());
+                }
+                
+                List<OrganizationalEntity> excludedOwners = assignments.getExcludedOwners();
+                if(excludedOwners != null) {
+                    for(OrganizationalEntity exowner : excludedOwners) {
+                        if(exowner instanceof User) {
+                            doCallbackUserOperation(exowner.getId());
+                        }
+                        if(exowner instanceof Group) {
+                            doCallbackGroupOperation(exowner.getId());
+                        }
+                    }
+                }
+                
+                List<OrganizationalEntity> recipients = assignments.getRecipients();
+                if(recipients != null) {
+                    for(OrganizationalEntity recipient : recipients) {
+                        if(recipient instanceof User) {
+                            doCallbackUserOperation(recipient.getId());
+                        }
+                        if(recipient instanceof Group) {
+                            doCallbackGroupOperation(recipient.getId());
+                        }
+                    }
+                }
+                
+                List<OrganizationalEntity> stakeholders = assignments.getTaskStakeholders();
+                if(stakeholders != null) {
+                    for(OrganizationalEntity stakeholder : stakeholders) {
+                        if(stakeholder instanceof User) {
+                            doCallbackUserOperation(stakeholder.getId());
+                        }
+                        if(stakeholder instanceof Group) {
+                            doCallbackGroupOperation(stakeholder.getId());
+                        }
+                    }
+                }
+            }
+        }
+        
+    }
+    
+    private void doCallbackOperationForComment(Comment comment) {
+        if(comment != null) {
+            if(comment.getAddedBy() != null) {
+                doCallbackUserOperation(comment.getAddedBy().getId());
+            }
+        }
+    }
+    
+    private void doCallbackOperationForAttachment(Attachment attachment) {
+        if(attachment != null) {
+            if(attachment.getAttachedBy() != null) {
+                doCallbackUserOperation(attachment.getAttachedBy().getId());
+            }
+        }
+    }
+    private void doCallbackOperationForTaskDeadlines(Deadlines deadlines) {
+        if(deadlines != null) {
+            if(deadlines.getStartDeadlines() != null) {
+                List<Deadline> startDeadlines = deadlines.getStartDeadlines();
+                for(Deadline startDeadline : startDeadlines) {
+                    List<Escalation> escalations = startDeadline.getEscalations();
+                    if(escalations != null) {
+                        for(Escalation escalation : escalations) {
+                            List<Notification> notifications = escalation.getNotifications();
+                            List<Reassignment> ressignments = escalation.getReassignments();
+                            if(notifications != null) {
+                                for(Notification notification : notifications) {
+                                    List<OrganizationalEntity> recipients = notification.getRecipients();
+                                    if(recipients != null) {
+                                        for(OrganizationalEntity recipient : recipients) {
+                                            if(recipient instanceof User) {
+                                                doCallbackUserOperation(recipient.getId());
+                                            }
+                                            if(recipient instanceof Group) {
+                                                doCallbackGroupOperation(recipient.getId());
+                                            }
+                                        }
+                                    }
+                                    List<OrganizationalEntity> administrators = notification.getBusinessAdministrators();
+                                    if(administrators != null) {
+                                        for(OrganizationalEntity administrator : administrators) {
+                                            if(administrator instanceof User) {
+                                                doCallbackUserOperation(administrator.getId());
+                                            }
+                                            if(administrator instanceof Group) {
+                                                doCallbackGroupOperation(administrator.getId());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if(ressignments != null) {
+                                for(Reassignment reassignment : ressignments) {
+                                    List<OrganizationalEntity> potentialOwners = reassignment.getPotentialOwners();
+                                    if(potentialOwners != null) {
+                                        for(OrganizationalEntity potentialOwner : potentialOwners) {
+                                            if(potentialOwner instanceof User) {
+                                                doCallbackUserOperation(potentialOwner.getId());
+                                            }
+                                            if(potentialOwner instanceof Group) {
+                                                doCallbackGroupOperation(potentialOwner.getId());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if(deadlines.getEndDeadlines() != null) {
+                List<Deadline> endDeadlines = deadlines.getEndDeadlines();
+                for(Deadline endDeadline : endDeadlines) {
+                    List<Escalation> escalations = endDeadline.getEscalations();
+                    if(escalations != null) {
+                        for(Escalation escalation : escalations) {
+                            List<Notification> notifications = escalation.getNotifications();
+                            List<Reassignment> ressignments = escalation.getReassignments();
+                            if(notifications != null) {
+                                for(Notification notification : notifications) {
+                                    List<OrganizationalEntity> recipients = notification.getRecipients();
+                                    if(recipients != null) {
+                                        for(OrganizationalEntity recipient : recipients) {
+                                            if(recipient instanceof User) {
+                                                doCallbackUserOperation(recipient.getId());
+                                            }
+                                            if(recipient instanceof Group) {
+                                                doCallbackGroupOperation(recipient.getId());
+                                            }
+                                        }
+                                    }
+                                    List<OrganizationalEntity> administrators = notification.getBusinessAdministrators();
+                                    if(administrators != null) {
+                                        for(OrganizationalEntity administrator : administrators) {
+                                            if(administrator instanceof User) {
+                                                doCallbackUserOperation(administrator.getId());
+                                            }
+                                            if(administrator instanceof Group) {
+                                                doCallbackGroupOperation(administrator.getId());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if(ressignments != null) {
+                                for(Reassignment reassignment : ressignments) {
+                                    List<OrganizationalEntity> potentialOwners = reassignment.getPotentialOwners();
+                                    if(potentialOwners != null) {
+                                        for(OrganizationalEntity potentialOwner : potentialOwners) {
+                                            if(potentialOwner instanceof User) {
+                                                doCallbackUserOperation(potentialOwner.getId());
+                                            }
+                                            if(potentialOwner instanceof Group) {
+                                                doCallbackGroupOperation(potentialOwner.getId());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    
+    private void doCallbackGroupsOperation(String userId, List<String> groupIds) { 
+        if(UserGroupCallbackManager.getInstance().existsCallback()) {
+            if(userId != null) {
+                if(groupIds != null && groupIds.size() > 0) {
+                    for(String groupId : groupIds) {
+                        if(UserGroupCallbackManager.getInstance().getCallback().existsGroup(groupId) && 
+                                UserGroupCallbackManager.getInstance().getCallback().getGroupsForUser(userId, groupIds, null) != null &&
+                                UserGroupCallbackManager.getInstance().getCallback().getGroupsForUser(userId, groupIds, null).contains(groupId)) {
+                            addGroupFromCallbackOperation(groupId);
+                        }
+                    }
+                } else {
+                    if(!(userGroupsMap.containsKey(userId) && userGroupsMap.get(userId).booleanValue())) { 
+                        List<String> userGroups = UserGroupCallbackManager.getInstance().getCallback().getGroupsForUser(userId, null, null);
+                        if(userGroups != null && userGroups.size() > 0) {
+                            for(String group : userGroups) {
+                                addGroupFromCallbackOperation(group);
+                            }
+                            userGroupsMap.put(userId, true);
+                        }
+                    }
+                }
+            } else {
+                if(groupIds != null) {
+                    for(String groupId : groupIds) {
+                        addGroupFromCallbackOperation(groupId);
+                    }
+                }
+            }
+        } else {
+            logger.debug("UserGroupCallback has not been registered.");
+        }
+    }
+    
+    private void addGroupFromCallbackOperation(String groupId) {
+        try {
+            if(!isEmpty(groupId) && em.find(Group.class, groupId) == null) {
+                Group g = new Group(groupId);
+                addGroup(g);
+            }
+        } catch (Throwable t) {
+            logger.debug("Trying to add group " + groupId + ", but it already exists. ");
+        }
+    }
+    
+    private void addUserFromCallbackOperation(String userId) { 
+        try {
+            if(!isEmpty(userId) && em.find(User.class, userId) == null ) {
+                User toCreateUser = new User(userId);
+                addUser(toCreateUser);
+            }
+        } catch (Throwable t) {
+            logger.debug("Unable to add user " + userId);
+        }
+    }
+    
+    private boolean isEmpty(final CharSequence str) {
+        if ( str == null || str.length() == 0 ) {
+            return true;
+        }
+        for ( int i = 0, length = str.length(); i < length; i++ ){
+            if ( str.charAt( i ) != ' ' ) {
+                return false;
+            }
+        }
+        return true;
     }
 }

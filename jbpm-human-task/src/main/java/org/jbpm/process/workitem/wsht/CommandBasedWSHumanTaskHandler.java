@@ -28,6 +28,7 @@ import java.util.Map;
 
 import org.drools.SystemEventListenerFactory;
 import org.drools.runtime.KnowledgeRuntime;
+import org.drools.runtime.StatefulKnowledgeSession;
 import org.drools.runtime.process.WorkItem;
 import org.drools.runtime.process.WorkItemHandler;
 import org.drools.runtime.process.WorkItemManager;
@@ -74,27 +75,22 @@ public class CommandBasedWSHumanTaskHandler implements WorkItemHandler {
 		this.port = port;
 	}
 	
-	public void setClient(TaskClient client) {
-		this.client = client;
-	}
-	
 	public void connect() {
 		if (client == null) {
 			client = new TaskClient(new MinaTaskClientConnector("org.drools.process.workitem.wsht.WSHumanTaskHandler", 
 																new MinaTaskClientHandler(SystemEventListenerFactory.getSystemEventListener())));
 			boolean connected = client.connect(ipAddress, port);
-			
 			if (!connected) {
 				throw new IllegalArgumentException("Could not connect task client");
 			}
+			TaskEventKey key = new TaskEventKey(TaskCompletedEvent.class, -1);           
+			TaskCompletedHandler eventResponseHandler = new TaskCompletedHandler();
+			client.registerForEvent(key, false, eventResponseHandler);
+			key = new TaskEventKey(TaskFailedEvent.class, -1);           
+			client.registerForEvent(key, false, eventResponseHandler);
+			key = new TaskEventKey(TaskSkippedEvent.class, -1);           
+			client.registerForEvent(key, false, eventResponseHandler);
 		}
-		TaskEventKey key = new TaskEventKey(TaskCompletedEvent.class, -1);           
-		TaskCompletedHandler eventResponseHandler = new TaskCompletedHandler();
-		client.registerForEvent(key, false, eventResponseHandler);
-		key = new TaskEventKey(TaskFailedEvent.class, -1);           
-		client.registerForEvent(key, false, eventResponseHandler);
-		key = new TaskEventKey(TaskSkippedEvent.class, -1);           
-		client.registerForEvent(key, false, eventResponseHandler);
 	}
 
 	public void executeWorkItem(WorkItem workItem, WorkItemManager manager) {
@@ -129,6 +125,12 @@ public class CommandBasedWSHumanTaskHandler implements WorkItemHandler {
 		TaskData taskData = new TaskData();
 		taskData.setWorkItemId(workItem.getId());
 		taskData.setProcessInstanceId(workItem.getProcessInstanceId());
+		if(session != null && session.getProcessInstance(workItem.getProcessInstanceId()) != null) {
+			taskData.setProcessId(session.getProcessInstance(workItem.getProcessInstanceId()).getProcess().getId());
+		}
+		if(session != null && (session instanceof StatefulKnowledgeSession)) { 
+        	taskData.setProcessSessionId( ((StatefulKnowledgeSession) session).getId() );
+        }
 		taskData.setSkipable(!"false".equals(workItem.getParameter("Skippable")));
         //Sub Task Data
         Long parentId = (Long) workItem.getParameter("ParentId");
@@ -246,7 +248,6 @@ public class CommandBasedWSHumanTaskHandler implements WorkItemHandler {
 		public void execute(Task task) {
 			long workItemId = task.getTaskData().getWorkItemId();
 			if (task.getTaskData().getStatus() == Status.Completed) {
-				System.out.println("Notification of completed task " + workItemId);
 				String userId = task.getTaskData().getActualOwner().getId();
 				Map<String, Object> results = new HashMap<String, Object>();
 				results.put("ActorId", userId);
@@ -259,7 +260,6 @@ public class CommandBasedWSHumanTaskHandler implements WorkItemHandler {
 					session.getWorkItemManager().completeWorkItem(workItemId, results);
 				}
 			} else {
-				System.out.println("Notification of aborted task " + workItemId);
 				session.getWorkItemManager().abortWorkItem(workItemId);
 			}
 		}
@@ -275,7 +275,6 @@ public class CommandBasedWSHumanTaskHandler implements WorkItemHandler {
     		this.results = results;
     	}
     	
-		@SuppressWarnings("unchecked")
 		public void execute(Content content) {
 			ByteArrayInputStream bis = new ByteArrayInputStream(content.getContent());
 			ObjectInputStream in;

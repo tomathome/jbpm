@@ -1,26 +1,22 @@
 package org.jbpm.persistence.session;
 
-import static org.jbpm.persistence.util.PersistenceUtil.*;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.fail;
+import static org.drools.persistence.util.PersistenceUtil.JBPM_PERSISTENCE_UNIT_NAME;
+import static org.drools.runtime.EnvironmentName.ENTITY_MANAGER_FACTORY;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 
 import javax.naming.InitialContext;
 import javax.naming.NamingException;
 import javax.persistence.EntityManager;
 import javax.persistence.EntityManagerFactory;
-import javax.persistence.Persistence;
 import javax.transaction.HeuristicMixedException;
 import javax.transaction.HeuristicRollbackException;
 import javax.transaction.NotSupportedException;
 import javax.transaction.RollbackException;
+import javax.transaction.Status;
 import javax.transaction.SystemException;
 import javax.transaction.UserTransaction;
 
@@ -28,7 +24,6 @@ import junit.framework.Assert;
 
 import org.drools.KnowledgeBase;
 import org.drools.KnowledgeBaseFactory;
-import org.drools.base.MapGlobalResolver;
 import org.drools.builder.KnowledgeBuilder;
 import org.drools.builder.KnowledgeBuilderConfiguration;
 import org.drools.builder.KnowledgeBuilderError;
@@ -40,8 +35,10 @@ import org.drools.io.impl.ClassPathResource;
 import org.drools.marshalling.ObjectMarshallingStrategy;
 import org.drools.marshalling.impl.ClassObjectMarshallingStrategyAcceptor;
 import org.drools.marshalling.impl.SerializablePlaceholderResolverStrategy;
+import org.drools.marshalling.util.MarshallingTestUtil;
 import org.drools.persistence.jpa.JPAKnowledgeService;
 import org.drools.persistence.jpa.marshaller.JPAPlaceholderResolverStrategy;
+import org.drools.persistence.util.PersistenceUtil;
 import org.drools.process.core.Work;
 import org.drools.process.core.datatype.impl.type.ObjectDataType;
 import org.drools.process.core.impl.WorkImpl;
@@ -52,7 +49,15 @@ import org.drools.runtime.process.ProcessContext;
 import org.drools.runtime.process.ProcessInstance;
 import org.drools.runtime.process.WorkItem;
 import org.drools.runtime.process.WorkflowProcessInstance;
-import org.jbpm.JbpmTestCase;
+import org.jbpm.persistence.JbpmTestCase;
+import org.jbpm.persistence.session.objects.MyEntity;
+import org.jbpm.persistence.session.objects.MyEntityMethods;
+import org.jbpm.persistence.session.objects.MyEntityOnlyFields;
+import org.jbpm.persistence.session.objects.MySubEntity;
+import org.jbpm.persistence.session.objects.MySubEntityMethods;
+import org.jbpm.persistence.session.objects.MyVariableExtendingSerializable;
+import org.jbpm.persistence.session.objects.MyVariableSerializable;
+import org.jbpm.persistence.session.objects.TestWorkItemHandler;
 import org.jbpm.process.core.context.variable.Variable;
 import org.jbpm.process.instance.impl.Action;
 import org.jbpm.ruleflow.core.RuleFlowProcess;
@@ -65,37 +70,38 @@ import org.jbpm.workflow.core.node.EndNode;
 import org.jbpm.workflow.core.node.StartNode;
 import org.jbpm.workflow.core.node.WorkItemNode;
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import bitronix.tm.TransactionManagerServices;
-import bitronix.tm.resource.jdbc.PoolingDataSource;
-
 public class VariablePersistenceStrategyTest extends JbpmTestCase {
 
     private static Logger logger = LoggerFactory.getLogger( VariablePersistenceStrategyTest.class );
     
-    private PoolingDataSource ds1;
+    private HashMap<String, Object> context;
     private EntityManagerFactory emf;
 
     @Before
     public void setUp() throws Exception {
-        ds1 = setupPoolingDataSource();
-        ds1.init();
-        
-        emf = Persistence.createEntityManagerFactory( PERSISTENCE_UNIT_NAME );
+        context = PersistenceUtil.setupWithPoolingDataSource(JBPM_PERSISTENCE_UNIT_NAME);
+        emf = (EntityManagerFactory) context.get(ENTITY_MANAGER_FACTORY);
     }
 
     @After
     public void tearDown() throws Exception {
-        emf.close();
-        ds1.close();
+        PersistenceUtil.tearDown(context);
+    }
+
+    @AfterClass
+    public static void compareMarshalledData() { 
+        MarshallingTestUtil.compareMarshallingDataFromTest(JBPM_PERSISTENCE_UNIT_NAME);
     }
 
     @Test
-    public void testExtendingInterfaceVariablePersistence(){
+    public void testExtendingInterfaceVariablePersistence() throws Exception {
+        // Setup
         Environment env = createEnvironment();
         String processId = "extendingInterfaceVariablePersistence";
         String variableText = "my extending serializable variable text";
@@ -104,12 +110,16 @@ public class VariablePersistenceStrategyTest extends JbpmTestCase {
         StatefulKnowledgeSession ksession = createSession( kbase , env );
         Map<String, Object> initialParams = new HashMap<String, Object>();
         initialParams.put( "x", new MyVariableExtendingSerializable( variableText ) );
+        
+        // Start process and execute workItem
         long processInstanceId = ksession.startProcess( processId, initialParams ).getId();
+        
         ksession = reloadSession( ksession, kbase, env );
         
         long workItemId = TestWorkItemHandler.getInstance().getWorkItem().getId();
         ksession.getWorkItemManager().completeWorkItem( workItemId, null );
         
+        // Test
         Assert.assertNull( ksession.getProcessInstance( processInstanceId ) );
     }
 
@@ -168,12 +178,27 @@ public class VariablePersistenceStrategyTest extends JbpmTestCase {
     
     @Test
     public void testPersistenceVariables() throws NamingException, NotSupportedException, SystemException, RollbackException, HeuristicMixedException, HeuristicRollbackException {
+        EntityManager em = emf.createEntityManager();
+        UserTransaction utx = (UserTransaction) new InitialContext().lookup( "java:comp/UserTransaction" );
+        if( utx.getStatus() == Status.STATUS_NO_TRANSACTION ) { 
+            utx.begin();
+            em.joinTransaction();
+        }
+        int origNumMyEntities = em.createQuery("select i from MyEntity i").getResultList().size();
+        int origNumMyEntityMethods = em.createQuery("select i from MyEntityMethods i").getResultList().size();
+        int origNumMyEntityOnlyFields = em.createQuery("select i from MyEntityOnlyFields i").getResultList().size();
+        if( utx.getStatus() == Status.STATUS_ACTIVE ) { 
+            utx.commit();
+        }
+       
+        // Setup entities
         MyEntity myEntity = new MyEntity("This is a test Entity with annotation in fields");
         MyEntityMethods myEntityMethods = new MyEntityMethods("This is a test Entity with annotations in methods");
         MyEntityOnlyFields myEntityOnlyFields = new MyEntityOnlyFields("This is a test Entity with annotations in fields and without accesors methods");
         MyVariableSerializable myVariableSerializable = new MyVariableSerializable("This is a test SerializableObject");
-        EntityManager em = emf.createEntityManager();
-        UserTransaction utx = (UserTransaction) new InitialContext().lookup( "java:comp/UserTransaction" );
+
+        // persist entities
+        utx = (UserTransaction) new InitialContext().lookup( "java:comp/UserTransaction" );
         utx.begin();
         em.joinTransaction();
         em.persist(myEntity);
@@ -181,14 +206,12 @@ public class VariablePersistenceStrategyTest extends JbpmTestCase {
         em.persist(myEntityOnlyFields);
         utx.commit();
         em.close();
+        
+        // More setup
         Environment env =  createEnvironment();
         KnowledgeBase kbase = createKnowledgeBase( "VariablePersistenceStrategyProcess.rf" );
         StatefulKnowledgeSession ksession = createSession( kbase, env );
 
-       
-       
-        
-        
         logger.info("### Starting process ###");
         Map<String, Object> parameters = new HashMap<String, Object>();
         parameters.put("x", "SomeString");
@@ -196,18 +219,21 @@ public class VariablePersistenceStrategyTest extends JbpmTestCase {
         parameters.put("m", myEntityMethods);
         parameters.put("f", myEntityOnlyFields);
         parameters.put("z", myVariableSerializable);
+        
+        // Start process
         long processInstanceId = ksession.startProcess( "com.sample.ruleflow", parameters ).getId();
 
         TestWorkItemHandler handler = TestWorkItemHandler.getInstance();
         WorkItem workItem = handler.getWorkItem();
         assertNotNull( workItem );
         
+        // Test results
         List<?> result = emf.createEntityManager().createQuery("select i from MyEntity i").getResultList();
-        assertEquals(1, result.size());
+        assertEquals(origNumMyEntities + 1, result.size());
         result = emf.createEntityManager().createQuery("select i from MyEntityMethods i").getResultList();
-        assertEquals(1, result.size());
+        assertEquals(origNumMyEntityMethods + 1, result.size());
         result = emf.createEntityManager().createQuery("select i from MyEntityOnlyFields i").getResultList();
-        assertEquals(1, result.size());
+        assertEquals(origNumMyEntityOnlyFields + 1, result.size());
 
         logger.info("### Retrieving process instance ###");
         ksession = reloadSession( ksession, kbase, env );
@@ -278,18 +304,25 @@ public class VariablePersistenceStrategyTest extends JbpmTestCase {
     
     @Test
     public void testPersistenceVariablesWithTypeChange() throws NamingException, NotSupportedException, SystemException, RollbackException, HeuristicMixedException, HeuristicRollbackException {
+
         MyEntity myEntity = new MyEntity("This is a test Entity with annotation in fields");
         MyEntityMethods myEntityMethods = new MyEntityMethods("This is a test Entity with annotations in methods");
         MyEntityOnlyFields myEntityOnlyFields = new MyEntityOnlyFields("This is a test Entity with annotations in fields and without accesors methods");
         MyVariableSerializable myVariableSerializable = new MyVariableSerializable("This is a test SerializableObject");
+
         EntityManager em = emf.createEntityManager();
         UserTransaction utx = (UserTransaction) new InitialContext().lookup( "java:comp/UserTransaction" );
-        utx.begin();
+        int s = utx.getStatus();
+        if( utx.getStatus() == Status.STATUS_NO_TRANSACTION ) { 
+            utx.begin();
+        }
         em.joinTransaction();
         em.persist(myEntity);
         em.persist(myEntityMethods);
         em.persist(myEntityOnlyFields);
-        utx.commit();
+        if( utx.getStatus() == Status.STATUS_ACTIVE ) { 
+            utx.commit();
+        }
         em.close();
         Environment env = createEnvironment();
         KnowledgeBase kbase = createKnowledgeBase( "VariablePersistenceStrategyProcessTypeChange.rf" );
@@ -541,10 +574,7 @@ public class VariablePersistenceStrategyTest extends JbpmTestCase {
     }
 
     private Environment createEnvironment() {
-        Environment env = KnowledgeBaseFactory.newEnvironment();
-        env.set(EnvironmentName.ENTITY_MANAGER_FACTORY, emf);
-        env.set(EnvironmentName.GLOBALS, new MapGlobalResolver());
-        env.set( EnvironmentName.TRANSACTION_MANAGER, TransactionManagerServices.getTransactionManager() );
+        Environment env = PersistenceUtil.createEnvironment(context);
         env.set(EnvironmentName.OBJECT_MARSHALLING_STRATEGIES, new ObjectMarshallingStrategy[]{
                                     new JPAPlaceholderResolverStrategy(env),
                                     new SerializablePlaceholderResolverStrategy( ClassObjectMarshallingStrategyAcceptor.DEFAULT  )

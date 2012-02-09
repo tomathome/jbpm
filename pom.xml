@@ -6,8 +6,9 @@
   <parent>
     <groupId>org.drools</groupId>
     <artifactId>droolsjbpm-parent</artifactId>
-    <version>5.3.0-SNAPSHOT</version>
-    <relativePath>../droolsjbpm-build-bootstrap/pom.xml</relativePath>
+    <version>5.3.2-SNAPSHOT</version>
+    <!-- relativePath causes out-of-date problems on hudson slaves -->
+    <!--<relativePath>../droolsjbpm-build-bootstrap/pom.xml</relativePath>-->
   </parent>
 
   <groupId>org.jbpm</groupId>
@@ -21,16 +22,13 @@
   <!-- major.minor.micro.Final -->
   <!-- For example: 1.2.3 without the suffix ".Final" corrupts the OSGi eclipse updatesite -->
   <!-- For example: 1.2.3.M2 corrupts the OSGi eclipse updatesite update order -->
-  <version>5.2.0-SNAPSHOT</version>
+  <version>5.3.0-SNAPSHOT</version>
 
   <name>jBPM multiproject</name>
   <description>jBPM: a Business Process Management (BPM) Suite</description>
   <url>http://www.jboss.org/jbpm/</url>
 
   <properties>
-    <!-- Undo the hack on the droolsjbpm-parent pom because Drools 5.3.0 is released without a jBPM release -->
-    <jbpm.version>5.2.0-SNAPSHOT</jbpm.version>
-    <jbpm.osgi.version>5.2.0.SNAPSHOT</jbpm.osgi.version>
     <!--
      These are properties used in the database profiles. Some of them must be initialized
      empty so that Maven applies them via filtering to the resources. 
@@ -43,9 +41,11 @@
     <maven.jdbc.db.port/>
     <maven.jdbc.db.server/>     
     <maven.jdbc.driver.jar/>
-    <maven.jdbc.username>sa</maven.jdbc.username>
+    <maven.jdbc.username></maven.jdbc.username>
     <maven.jdbc.password></maven.jdbc.password>
-    <maven.jdbc.url>jdbc:h2:tcp://localhost/JPADroolsFlow</maven.jdbc.url>
+    <maven.jdbc.url>jdbc:h2:</maven.jdbc.url>
+    <jbpm.version>5.3.0-SNAPSHOT</jbpm.version>
+    <jbpm.osgi.version>5.3.0.SNAPSHOT</jbpm.osgi.version>
   </properties>
 
   <repositories>
@@ -85,7 +85,9 @@
     <module>jbpm-bpmn2-emfextmodel</module>
     <module>jbpm-workitems</module>
     <module>jbpm-human-task</module>
+    <module>jbpm-human-task-war</module>
     <module>jbpm-gwt</module>
+    <module>jbpm-test</module>
     <module>jbpm-examples</module>
   </modules>
 
@@ -99,6 +101,25 @@
         <directory>src/test/resources</directory>
       </testResource>
     </testResources>
+     <pluginManagement>
+      <plugins>
+     	<plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>2.6</version>
+          <configuration>
+            <includes>
+              <include>**/*Test.java</include>
+            </includes>
+            <excludes>
+              <exclude>**/*AbstractTest.java</exclude>
+              <exclude>**/*JMS*Test.java</exclude>
+            </excludes>
+            <argLine>-Xmx1024m -XX:MaxPermSize=128m</argLine>
+          </configuration>
+        </plugin> 
+      </plugins>
+     </pluginManagement>
   </build>
 
   <profiles>
@@ -114,12 +135,12 @@
         <module>jbpm-distribution</module>
       </modules>
     </profile>
+
     <profile>
       <id>database</id>
-       
       <dependencies>
         <!--  Add the downloaded jdbc driver jar for the database to the classpath.
-              !: <groupId>, <artifactId> and <version> are just placeholders and DO NOT MATTER! -->
+              Warning: <groupId>, <artifactId> and <version> are just placeholders and do not matter. -->
         <dependency>
            <groupId>org.jbpm</groupId>
            <artifactId>downloaded-jdbc-driver-jar</artifactId>
@@ -129,13 +150,9 @@
         </dependency>  
       </dependencies>
     </profile>
-    
-    <!--  
-    The following is an example of how to test with a particular database:
-    
+    <!-- The following is an example of how to test with a particular database:
     <profile>
         <id>postgresql</id>
-        
         <properties>
           <! see http://docs.jboss.org/hibernate/core/3.6/reference/en-US/html/session-configuration.html#configuration-optional-dialects 
           <maven.hibernate.dialect>org.hibernate.dialect.PostgreSQLDialect</maven.hibernate.dialect>
@@ -154,10 +171,6 @@
           <maven.jdbc.password>jbpm3</maven.jdbc.password>
           <maven.jdbc.url>jdbc:postgresql://localhost:5432/jbpm3</maven.jdbc.url>
         </properties>
-
-         <! Add the downloaded jdbc driver jar for the database to the classpath
-         <! !: Both <groupId> and <artifactId> are just placeholders and DO NOT MATTER!
-        
         <dependencies>
           <dependency>
             <groupId>org.jboss</groupId>

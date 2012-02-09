@@ -16,6 +16,7 @@
 
 package org.jbpm.task.service;
 
+import org.jbpm.task.AsyncTaskService;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,7 +40,7 @@ import org.jbpm.task.service.TaskClientHandler.SetDocumentResponseHandler;
 import org.jbpm.task.service.TaskClientHandler.TaskOperationResponseHandler;
 import org.jbpm.task.service.TaskClientHandler.TaskSummaryResponseHandler;
 
-public class TaskClient  {
+public class TaskClient implements AsyncTaskService{
 
     private final BaseHandler handler;
 	private final AtomicInteger counter;
@@ -470,10 +471,18 @@ public class TaskClient  {
     public void getTasksAssignedAsPotentialOwner(String userId, List<String> groupIds,
                                                  String language,
                                                  TaskSummaryResponseHandler responseHandler) {
-        List<Object> args = new ArrayList<Object>( 2 );
+    	getTasksAssignedAsPotentialOwner(userId, groupIds, language, -1, -1, responseHandler);
+    }
+    
+    public void getTasksAssignedAsPotentialOwner(String userId, List<String> groupIds,
+                                                 String language, int firstResult, int maxResult,
+                                                 TaskSummaryResponseHandler responseHandler) {
+        List<Object> args = new ArrayList<Object>( 5 );
         args.add( userId );
         args.add( groupIds );
         args.add( language );
+        args.add( firstResult );
+        args.add( maxResult );
         Command cmd = new Command( counter.getAndIncrement(),
                                    CommandName.QueryTasksAssignedAsPotentialOwnerWithGroup,
                                    args );
@@ -748,5 +757,4 @@ public class TaskClient  {
     public void disconnect() throws Exception {
     	connector.disconnect();
     }
-
 }

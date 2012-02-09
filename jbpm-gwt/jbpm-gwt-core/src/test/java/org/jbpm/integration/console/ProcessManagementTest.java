@@ -1,7 +1,5 @@
 package org.jbpm.integration.console;
 
-import static org.junit.Assert.assertEquals;
-
 import java.util.HashMap;
 import java.util.List;
 
@@ -10,7 +8,6 @@ import org.jboss.bpm.console.client.model.ProcessInstanceRef.RESULT;
 import org.jboss.bpm.console.client.model.ProcessInstanceRef.STATE;
 import org.jbpm.integration.JbpmTestCase;
 import org.jbpm.process.audit.JPAProcessInstanceDbLog;
-import org.jbpm.process.audit.ProcessInstanceDbLog;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Ignore;
